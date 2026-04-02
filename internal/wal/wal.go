@@ -11,6 +11,11 @@
 //
 // In Week 2, this WAL will be superseded by the Raft log, which acts
 // as the distributed equivalent. For now it gives us single-node durability.
+
+
+// before writing anything to RAM it writes it to the log to a file on disk 
+// if a sever crashes, on the restart, it replays every command 
+// uses BoltDB 
 package wal
 
 import (

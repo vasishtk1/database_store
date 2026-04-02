@@ -9,6 +9,9 @@
 //  1. Open the WAL (creates the file if it's the first run)
 //  2. Replay the WAL into the in-memory store (no-op on first run)
 //  3. Start accepting TCP connections
+
+// entry point of the program, starts the TCP server, and waits for the clients
+
 package main
 
 import (
@@ -24,7 +27,7 @@ import (
 func main() {
 	// Command-line flags so the server is easy to configure at startup.
 	// Example: ./database_store --addr :9000 --wal /var/data/kv.wal
-	addr    := flag.String("addr", ":8080", "TCP address the server listens on")
+	addr := flag.String("addr", ":8080", "TCP address the server listens on")
 	walPath := flag.String("wal", "data.wal", "Path to the WAL file (created if absent)")
 	flag.Parse()
 

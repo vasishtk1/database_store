@@ -46,7 +46,7 @@ func New(addr string, s *store.Store, w *wal.WAL) *Server {
 	return &Server{addr: addr, store: s, wal: w}
 }
 
-// Start binds to the TCP address and blocks, accepting client connections.
+// Start binds to srv.addr and blocks, accepting client connections.
 // Each accepted connection is handed off to handleConn in a new goroutine.
 func (srv *Server) Start() error {
 	ln, err := net.Listen("tcp", srv.addr)
@@ -54,18 +54,20 @@ func (srv *Server) Start() error {
 		return fmt.Errorf("listen on %s: %w", srv.addr, err)
 	}
 	defer ln.Close()
+	return srv.Serve(ln)
+}
 
-	fmt.Printf("KV server listening on %s\n", srv.addr)
+// Serve accepts connections on ln until Accept fails (for example when ln is closed).
+// Used by Start after Listen; tests pass a listener bound to 127.0.0.1:0 for a free port.
+func (srv *Server) Serve(ln net.Listener) error {
+	fmt.Printf("KV server listening on %s\n", ln.Addr())
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			// Accept failing is usually fatal (e.g. listener closed).
 			return fmt.Errorf("accept: %w", err)
 		}
 
-		// Spin up a goroutine per connection — cheap in Go and keeps
-		// the accept loop free to handle the next incoming client.
 		go srv.handleConn(conn)
 	}
 }
