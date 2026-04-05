@@ -78,6 +78,37 @@ type AppendEntriesArgs struct {
 	LeaderCommit int
 }
 
+// ── InstallSnapshot ───────────────────────────────────────────────────────────
+//
+// Sent by the leader to a follower that has fallen so far behind that the
+// log entries it needs have already been compacted into a snapshot.
+// Instead of replaying hundreds of individual entries, the leader ships the
+// full snapshot in one RPC so the follower can catch up instantly.
+
+// InstallSnapshotArgs is what the leader sends.
+type InstallSnapshotArgs struct {
+	// Term is the leader's current term.
+	Term     int
+	LeaderID string
+
+	// LastIncludedIndex and LastIncludedTerm describe the last log entry
+	// covered by this snapshot. After installing, the follower's log
+	// starts fresh from this point.
+	LastIncludedIndex int
+	LastIncludedTerm  int
+
+	// Data is the full serialised state of the KV store at LastIncludedIndex.
+	// The follower replaces its entire store with this data.
+	Data []byte
+}
+
+// InstallSnapshotReply is what the follower sends back.
+type InstallSnapshotReply struct {
+	// Term is the follower's current term. If higher than the leader's,
+	// the leader steps down.
+	Term int
+}
+
 // AppendEntriesReply is what the follower sends back.
 type AppendEntriesReply struct {
 	// Term is the follower's current term (leader steps down if stale).

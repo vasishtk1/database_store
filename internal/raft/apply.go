@@ -31,13 +31,16 @@ package raft
 
 import (
 	"log"
+	"sync/atomic"
 	"time"
 )
 
 // runApplyLoop runs forever as a background goroutine (started in node.go).
-// Every 10 ms it checks whether any newly committed entries need to be
-// delivered to the KV store. When it finds some, it sends them on applyCh
-// in strict log order so the store always sees a consistent sequence.
+//
+// On startup it first delivers any pending snapshot (loaded from disk or
+// received via InstallSnapshot). Then it enters its normal loop: every 10 ms
+// it checks whether any newly committed log entries need to be delivered to
+// the KV store via applyCh.
 //
 // Why poll every 10ms instead of using a channel signal?
 // Simplicity. A production system would use a sync.Cond to wake this loop
@@ -45,36 +48,77 @@ import (
 // to reason about for a first implementation.
 func (n *Node) runApplyLoop() {
 	for {
-		// Sleep first so we don't spin-loop on startup before anything is committed.
+		if atomic.LoadInt32(&n.shutdown) != 0 {
+			return
+		}
+
 		time.Sleep(10 * time.Millisecond)
 
-		// ── Collect all newly committed entries ───────────────────────────
-		// We hold the lock only while reading state, then release it before
-		// sending on applyCh. This prevents a deadlock where the channel
-		// receiver (server.go) is waiting for the lock while we're blocked
-		// trying to send on the channel.
+		// ── Step 1: Deliver any pending snapshot ──────────────────────────
+		// This happens once on startup (if we loaded a snapshot from disk)
+		// or after an InstallSnapshot RPC arrives from the leader.
 		n.mu.Lock()
-		var toApply []LogEntry
-		for n.lastApplied < n.commitIndex {
-			n.lastApplied++
-			toApply = append(toApply, n.log[n.lastApplied])
+		var snapMsg *ApplyMsg
+		if n.pendingSnapshotApply && n.loadedSnapshot != nil {
+			snapMsg = &ApplyMsg{
+				IsSnapshot:    true,
+				Snapshot:      n.loadedSnapshot,
+				SnapshotIndex: n.snapshotIndex,
+				SnapshotTerm:  n.snapshotTerm,
+				Index:         n.snapshotIndex, // for WaitForApply compatibility
+			}
+			n.pendingSnapshotApply = false
+			n.loadedSnapshot = nil
 		}
 		n.mu.Unlock()
 
-		// ── Deliver each entry to the KV store (outside the lock) ─────────
+		if snapMsg != nil {
+			if atomic.LoadInt32(&n.shutdown) != 0 {
+				return
+			}
+			log.Printf("[raft %s] delivering snapshot to store | index=%d",
+				n.id, snapMsg.SnapshotIndex)
+			// Send outside the lock to avoid deadlock with the server's receiver.
+			n.applyCh <- *snapMsg
+		}
+
+		// ── Step 2: Collect all newly committed log entries ───────────────
+		// Hold the lock only while reading state, release before sending
+		// on applyCh. This prevents a deadlock where the channel receiver
+		// (server.go) is waiting for the lock while we're blocked on send.
+		n.mu.Lock()
+		var toApply []LogEntry
+		for n.lastApplied < n.commitIndex {
+			nextIdx := n.lastApplied + 1
+			arrIdx := n.arrayIdx(nextIdx)
+			if arrIdx < 0 || arrIdx >= len(n.log) {
+				// Do not advance lastApplied — wait until log catches up (e.g. race with compaction).
+				log.Printf("[raft %s] apply loop: arrIdx %d out of range for logIdx %d (commitIndex=%d)",
+					n.id, arrIdx, nextIdx, n.commitIndex)
+				break
+			}
+			n.lastApplied = nextIdx
+			toApply = append(toApply, n.log[arrIdx])
+		}
+		n.mu.Unlock()
+
+		// ── Step 3: Deliver each entry to the KV store ────────────────────
 		for _, entry := range toApply {
+			if atomic.LoadInt32(&n.shutdown) != 0 {
+				return
+			}
+			if entry.Index == 0 {
+				continue // sentinel — never applied
+			}
 			log.Printf("[raft %s] applying index=%d op=%s key=%s",
 				n.id, entry.Index, entry.Op, entry.Key)
 
-			// Send the ApplyMsg to the channel. The server.go goroutine
-			// on the other end will call store.Put() or store.Delete().
-			// This send blocks if the receiver is slow — that's intentional
-			// back-pressure to prevent unbounded memory growth.
 			n.applyCh <- ApplyMsg{
-				Index: entry.Index,
-				Op:    entry.Op,
-				Key:   entry.Key,
-				Value: entry.Value,
+				IsSnapshot: false,
+				Index:      entry.Index,
+				Op:         entry.Op,
+				Key:        entry.Key,
+				Value:      entry.Value,
 			}
 		}
 	}

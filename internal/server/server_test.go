@@ -44,7 +44,7 @@ func startTestServer(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := New("", s, w)
+	srv := New("", s, w, nil)
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.Serve(ln) }()
 	t.Cleanup(func() {

@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/rpc"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -91,6 +92,22 @@ type Node struct {
 	electionTimer *time.Timer        // fires if no heartbeat received in time
 	rpcClients    map[string]*rpc.Client // cached TCP connections to peers
 	listener      net.Listener           // our own RPC server's TCP listener
+
+	// ── Snapshot state ────────────────────────────────────────────────────
+	// After log compaction, log entries <= snapshotIndex are discarded.
+	// The log array then starts at snapshotIndex (log[0] is a sentinel
+	// representing the last included entry).
+	snapshotIndex int // log index of the last entry included in the snapshot
+	snapshotTerm  int // term of that entry
+
+	// loadedSnapshot holds the raw KV bytes loaded from disk at startup,
+	// or received via InstallSnapshot. The apply loop delivers it once
+	// as an ApplyMsg{IsSnapshot:true} and then clears this field.
+	loadedSnapshot       []byte
+	pendingSnapshotApply bool // true when loadedSnapshot needs to be delivered
+
+	// shutdown is set to 1 from Stop() so background goroutines exit cleanly.
+	shutdown int32
 }
 
 // New creates, initialises, and starts a Raft node.
@@ -126,7 +143,7 @@ func New(id string, peers map[string]string, dbPath, listenAddr string, applyCh 
 	}
 
 	// Step 3: load previously saved state (or zero values on first run).
-	term, votedFor, savedLog, err := p.load()
+	term, votedFor, savedLog, commitIdx, err := p.load()
 	if err != nil {
 		p.close()
 		return nil, fmt.Errorf("raft New: load state: %w", err)
@@ -134,14 +151,43 @@ func New(id string, peers map[string]string, dbPath, listenAddr string, applyCh 
 	n.currentTerm = term
 	n.votedFor = votedFor
 
-	// Always have at least the sentinel entry at index 0.
-	// The sentinel has Term=0 and is never applied — it exists so that
-	// "no previous entry" can be represented as PrevLogIndex=0, PrevLogTerm=0.
+	// Step 3a: load the snapshot (if any) so we know snapshotIndex/Term
+	// BEFORE reconstructing the log sentinel below.
+	snapData, snapIdx, snapTerm, err := p.loadSnapshot()
+	if err != nil {
+		p.close()
+		return nil, fmt.Errorf("raft New: load snapshot: %w", err)
+	}
+	n.snapshotIndex = snapIdx
+	n.snapshotTerm = snapTerm
+
+	// If there is a snapshot, queue it for delivery to the KV store so it
+	// restores its state before any further log entries are applied.
+	if snapData != nil && snapIdx > 0 {
+		n.loadedSnapshot = snapData
+		n.pendingSnapshotApply = true
+	}
+
+	// Rebuild the log. The sentinel lives at array position 0 and represents
+	// snapshotIndex (or 0 on a fresh node). All log[i].Index == snapshotIndex+i.
 	if len(savedLog) == 0 {
-		n.log = []LogEntry{{Index: 0, Term: 0}}
+		n.log = []LogEntry{{Index: snapIdx, Term: snapTerm}}
 	} else {
 		n.log = savedLog
 	}
+
+	// Restore durable commit index; clamp so it never points past our log.
+	n.commitIndex = commitIdx
+	if n.commitIndex < snapIdx {
+		n.commitIndex = snapIdx
+	}
+	if n.commitIndex > n.lastLogIndex() {
+		n.commitIndex = n.lastLogIndex()
+	}
+
+	// lastApplied starts at snapshotIndex because the snapshot covers those
+	// entries — the apply loop will pick up from here.
+	n.lastApplied = snapIdx
 
 	// Step 4: start the RPC server BEFORE the election timer so that when
 	// the timer fires and we send RequestVote, peers can already reply to us.
@@ -166,10 +212,19 @@ func New(id string, peers map[string]string, dbPath, listenAddr string, applyCh 
 // Stop shuts down the node: cancels the election timer, closes the RPC
 // listener (so incoming RPCs stop), and closes the BoltDB file.
 func (n *Node) Stop() {
+	atomic.StoreInt32(&n.shutdown, 1)
 	// Stop the election timer to prevent spurious elections after shutdown.
 	if n.electionTimer != nil {
 		n.electionTimer.Stop()
 	}
+	n.mu.Lock()
+	for id, c := range n.rpcClients {
+		if c != nil {
+			_ = c.Close()
+		}
+		delete(n.rpcClients, id)
+	}
+	n.mu.Unlock()
 	// Closing the listener causes the accept loop in transport.go to return.
 	if n.listener != nil {
 		n.listener.Close()
@@ -235,17 +290,58 @@ func (n *Node) LeaderID() string {
 	return ""
 }
 
+// LastApplied returns the highest log index that has been applied to the
+// KV store. Used by the server to poll for write completion.
+func (n *Node) LastApplied() int {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.lastApplied
+}
+
+// WaitForApply blocks until lastApplied >= index or the timeout elapses.
+// Returns true if the entry was applied in time, false on timeout.
+//
+// The server calls this after Submit() so it can wait for the write to
+// commit before responding "OK" to the client. We poll every 5 ms — simple
+// and correct; a sync.Cond would be faster but adds complexity.
+func (n *Node) WaitForApply(index int, timeoutMs int) bool {
+	if timeoutMs <= 0 {
+		n.mu.Lock()
+		ok := n.lastApplied >= index
+		n.mu.Unlock()
+		return ok
+	}
+	deadline := time.Now().Add(time.Duration(timeoutMs) * time.Millisecond)
+	const poll = 5 * time.Millisecond
+	for {
+		n.mu.Lock()
+		applied := n.lastApplied
+		n.mu.Unlock()
+		if applied >= index {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(poll)
+	}
+}
+
 // ── Internal helpers ─────────────────────────────────────────────────────────
 // These are small utility methods called by election.go and replication.go.
 // They all require n.mu to be held by the caller.
 
-// lastLogIndex returns the Index field of the last entry in our log.
-// Because of the sentinel at position 0 this is always >= 0.
+// lastLogIndex returns the highest log index currently stored.
+// After compaction: snapshotIndex + number of real entries.
+// Caller must hold n.mu.
 func (n *Node) lastLogIndex() int {
-	return n.log[len(n.log)-1].Index
+	// log[0] is the sentinel at snapshotIndex, so the last real index is:
+	//   snapshotIndex + (len(log) - 1)
+	return n.snapshotIndex + len(n.log) - 1
 }
 
-// lastLogTerm returns the Term field of the last entry in our log.
+// lastLogTerm returns the term of the last entry in the log array.
+// Caller must hold n.mu.
 func (n *Node) lastLogTerm() int {
 	return n.log[len(n.log)-1].Term
 }
@@ -307,7 +403,7 @@ func (n *Node) becomeLeader() {
 // Call this every time any of those three fields changes.
 // Must be called with n.mu held.
 func (n *Node) persist() {
-	if err := n.persister.save(n.currentTerm, n.votedFor, n.log); err != nil {
+	if err := n.persister.save(n.currentTerm, n.votedFor, n.log, n.commitIndex); err != nil {
 		// Persistence failure is serious; log it loudly.
 		log.Printf("[raft %s] PERSIST ERROR: %v", n.id, err)
 	}

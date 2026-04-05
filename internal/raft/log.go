@@ -40,18 +40,28 @@ type LogEntry struct {
 	Value string `json:"value,omitempty"`
 }
 
-// ApplyMsg is sent on the applyCh channel whenever an entry is committed.
+// ApplyMsg is sent on the applyCh channel whenever an entry is committed
+// OR when a snapshot must be installed on startup / after falling too far behind.
 //
-// "Committed" means a majority of nodes have the entry in their logs and
-// it will never be overwritten. At this point it is safe — and required —
-// to apply it to the in-memory store.
+// There are two kinds of ApplyMsg:
 //
-// The server reads from applyCh in a loop and calls store.Put / store.Delete
-// for each message it receives. This is the bridge between the Raft layer
-// and the key-value store built in Week 1.
+//  1. Normal entry (IsSnapshot=false):
+//     The server calls store.Put / store.Delete for the given op/key/value.
+//
+//  2. Snapshot (IsSnapshot=true):
+//     The server replaces the entire store contents with the snapshot data.
+//     This happens on restart (load from disk) or when a follower is so far
+//     behind the leader that the missing log entries have been compacted away.
 type ApplyMsg struct {
-	Index int    // which log position this is (useful for deduplication)
-	Op    string // "PUT" or "DELETE"
-	Key   string
-	Value string // empty for DELETE
+	// ── Normal entry fields ───────────────────────────────────────────────
+	IsSnapshot bool   // true → this is a snapshot install, not a log entry
+	Index      int    // log position (used for deduplication and WaitForApply)
+	Op         string // "PUT" or "DELETE"  (ignored when IsSnapshot=true)
+	Key        string // (ignored when IsSnapshot=true)
+	Value      string // empty for DELETE   (ignored when IsSnapshot=true)
+
+	// ── Snapshot fields (only set when IsSnapshot=true) ───────────────────
+	Snapshot      []byte // serialised KV map (JSON-encoded map[string]string)
+	SnapshotIndex int    // lastIncludedIndex: the log index covered by this snapshot
+	SnapshotTerm  int    // lastIncludedTerm:  the term of that log entry
 }

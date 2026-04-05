@@ -1,0 +1,19 @@
+{
+  "nodes": [
+    {
+      "id":        "node1",
+      "raft_addr": "localhost:7001",
+      "kv_addr":   "localhost:8001"
+    },
+    {
+      "id":        "node2",
+      "raft_addr": "localhost:7002",
+      "kv_addr":   "localhost:8002"
+    },
+    {
+      "id":        "node3",
+      "raft_addr": "localhost:7003",
+      "kv_addr":   "localhost:8003"
+    }
+  ]
+}

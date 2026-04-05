@@ -79,20 +79,28 @@ func (n *Node) sendAppendEntries(peerID string) {
 		return
 	}
 
-	// nextIndex[peerID] is the next log index we should send to this peer.
-	// Everything from nextIndex onwards is "new" for the peer.
 	nextIdx := n.nextIndex[peerID]
 
-	// prevLogIndex is the index of the entry immediately before the new ones.
-	// The peer will check that it has this entry with prevLogTerm — if not,
-	// it will reject the call and we'll back up nextIndex.
-	prevLogIndex := nextIdx - 1
-	prevLogTerm  := n.log[prevLogIndex].Term // safe: prevLogIndex >= 0 always
+	// ── Snapshot path: follower has fallen behind the compaction point ────
+	// If the next entry we'd send has already been discarded into a snapshot,
+	// we can't replay it from the log. Send the full snapshot instead.
+	if nextIdx <= n.snapshotIndex {
+		n.mu.Unlock()
+		go n.sendInstallSnapshot(peerID)
+		return
+	}
 
-	// Entries to send: everything in our log from nextIdx to the end.
-	// If nextIdx == len(n.log) this is empty — pure heartbeat.
-	entries := make([]LogEntry, len(n.log[nextIdx:]))
-	copy(entries, n.log[nextIdx:])
+	// prevLogIndex is the index of the entry immediately before the new ones.
+	// Convert to array index using snapshotIndex as the base offset.
+	prevLogIndex := nextIdx - 1
+	prevArrIdx   := n.arrayIdx(prevLogIndex) // = prevLogIndex - snapshotIndex
+	prevLogTerm  := n.log[prevArrIdx].Term
+
+	// Entries to send: everything from nextIdx to end of log.
+	// Convert nextIdx to array position first.
+	nextArrIdx := n.arrayIdx(nextIdx)
+	entries := make([]LogEntry, len(n.log[nextArrIdx:]))
+	copy(entries, n.log[nextArrIdx:])
 
 	args := &AppendEntriesArgs{
 		Term:         n.currentTerm,
@@ -168,9 +176,13 @@ func (n *Node) sendAppendEntries(peerID string) {
 			n.nextIndex[peerID] = newNext
 		}
 
-		// nextIndex must never go below 1 (index 0 is the sentinel).
-		if n.nextIndex[peerID] < 1 {
-			n.nextIndex[peerID] = 1
+		// nextIndex must not point before the first real entry after the snapshot.
+		minNext := n.snapshotIndex + 1
+		if minNext < 1 {
+			minNext = 1
+		}
+		if n.nextIndex[peerID] < minNext {
+			n.nextIndex[peerID] = minNext
 		}
 	}
 }
@@ -182,36 +194,42 @@ func (n *Node) sendAppendEntries(peerID string) {
 // Safety rule from the Raft paper: a leader can only commit entries from its
 // CURRENT term. It may implicitly commit older entries at the same time, but
 // it must not count them alone — doing so can lead to committed entries being
-// overwritten. We enforce this with the `n.log[idx].Term != n.currentTerm` check.
+// overwritten. We enforce this with the `n.log[arrIdx].Term != n.currentTerm` check.
 //
 // Must be called with n.mu held.
 func (n *Node) maybeAdvanceCommitIndex() {
 	lastIdx    := n.lastLogIndex()
 	totalNodes := len(n.peers) + 1 // peers + leader
+	prevCommit := n.commitIndex
 
-	// Walk forward from commitIndex+1 and find the highest index where a
-	// majority of nodes have the entry.
 	for idx := n.commitIndex + 1; idx <= lastIdx; idx++ {
-		// Only commit entries from the current term (see safety note above).
-		if n.log[idx].Term != n.currentTerm {
+		// Convert log index to array index using snapshotIndex as base.
+		arrIdx := n.arrayIdx(idx)
+		if arrIdx < 0 || arrIdx >= len(n.log) {
 			continue
 		}
 
-		// Count how many nodes have this entry (leader always has it = 1).
-		count := 1
+		// Only commit entries from the current term (safety rule).
+		if n.log[arrIdx].Term != n.currentTerm {
+			continue
+		}
+
+		// Count how many nodes have replicated this index.
+		count := 1 // leader itself
 		for _, matchIdx := range n.matchIndex {
 			if matchIdx >= idx {
 				count++
 			}
 		}
 
-		// Majority check: count * 2 > totalNodes
-		// e.g. 3-node cluster needs count=2: 2*2=4 > 3 ✓
-		//      5-node cluster needs count=3: 3*2=6 > 5 ✓
+		// count*2 > totalNodes  ←→  count > totalNodes/2  (majority)
 		if count*2 > totalNodes {
 			n.commitIndex = idx
 			log.Printf("[raft %s] committed index=%d", n.id, idx)
 		}
+	}
+	if n.commitIndex != prevCommit {
+		n.persist()
 	}
 }
 
@@ -256,25 +274,45 @@ func (n *Node) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply)
 	// We must verify that our log matches the leader's log at the point just
 	// before the new entries. If it doesn't, we reject so the leader backs up.
 
+	// If PrevLogIndex is behind our snapshot, we've already applied those
+	// entries — accept vacuously (the leader is catching us up normally).
+	if args.PrevLogIndex < n.snapshotIndex {
+		// Trim any entries the snapshot already covers, then fall through
+		// to append the rest.
+		overlap := n.snapshotIndex - args.PrevLogIndex
+		if overlap < len(args.Entries) {
+			args.Entries = args.Entries[overlap:]
+			args.PrevLogIndex = n.snapshotIndex
+			args.PrevLogTerm = n.snapshotTerm
+		} else {
+			// All entries are before our snapshot — log unchanged, but we must
+			// still honor LeaderCommit so commitIndex can advance.
+			reply.Success = true
+			n.commitUpToLeader(args.LeaderCommit, n.lastLogIndex())
+			n.persist()
+			return nil
+		}
+	}
+
 	if args.PrevLogIndex > n.lastLogIndex() {
-		// We don't have an entry at PrevLogIndex at all — our log is shorter.
-		// Tell the leader to start sending from the end of our log.
+		// We don't have an entry at PrevLogIndex at all.
 		reply.ConflictTerm  = -1
 		reply.ConflictIndex = n.lastLogIndex() + 1
 		return nil
 	}
 
-	if args.PrevLogIndex > 0 && n.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		// We have an entry at PrevLogIndex but its term doesn't match.
-		// Tell the leader the first index where this conflict term starts
-		// so it can skip the whole conflicting section in one round-trip.
-		conflictTerm := n.log[args.PrevLogIndex].Term
+	prevArrIdx := n.arrayIdx(args.PrevLogIndex)
+	if args.PrevLogIndex > n.snapshotIndex && n.log[prevArrIdx].Term != args.PrevLogTerm {
+		// Term mismatch: tell the leader the first index of the conflicting term
+		// so it can skip the entire section in one round-trip.
+		conflictTerm := n.log[prevArrIdx].Term
 		reply.ConflictTerm = conflictTerm
 
-		// Walk backward to find the first index with this conflicting term.
-		for i := 1; i <= args.PrevLogIndex; i++ {
+		// Walk forward from the start of our log (after sentinel) to find
+		// the first entry with this conflicting term.
+		for i := 1; i < len(n.log); i++ {
 			if n.log[i].Term == conflictTerm {
-				reply.ConflictIndex = i
+				reply.ConflictIndex = n.snapshotIndex + i
 				break
 			}
 		}
@@ -282,44 +320,65 @@ func (n *Node) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply)
 	}
 
 	// ── Rule 4: Append new entries, resolving any conflicts ───────────────
-	// Walk through the incoming entries. For each one:
-	//   - If our log already has an entry at that index with the SAME term,
-	//     they match — no action needed, move to the next entry.
-	//   - If our log has an entry at that index with a DIFFERENT term,
-	//     our entry is stale — truncate from here and append the rest.
-	//   - If our log doesn't reach that index yet, just append.
 	for i, entry := range args.Entries {
-		idx := args.PrevLogIndex + 1 + i
+		// Log index of this entry.
+		logIdx := args.PrevLogIndex + 1 + i
+		arrIdx := n.arrayIdx(logIdx)
 
-		if idx < len(n.log) {
-			if n.log[idx].Term == entry.Term {
-				continue // already have this entry — skip
+		if arrIdx < len(n.log) {
+			if n.log[arrIdx].Term == entry.Term {
+				continue // already have this entry with matching term — skip
 			}
-			// Conflicting entry: truncate our log from idx onwards and
-			// append everything from args.Entries[i:].
-			n.log = n.log[:idx]
+			// Conflicting term: truncate from here and append the rest.
+			n.log = n.log[:arrIdx]
 			n.log = append(n.log, args.Entries[i:]...)
 			break
 		} else {
-			// Our log is shorter than the incoming entries; append the rest.
+			// Log is shorter than incoming entries; append the rest.
 			n.log = append(n.log, args.Entries[i:]...)
 			break
 		}
 	}
-	n.persist()
 
-	// ── Rule 5: Advance commitIndex ───────────────────────────────────────
-	// The leader tells us the highest index it has committed. We can advance
-	// our own commitIndex to min(LeaderCommit, index of last new entry).
-	// The min() ensures we don't commit entries we haven't actually received.
-	if args.LeaderCommit > n.commitIndex {
-		lastNewIdx := args.PrevLogIndex + len(args.Entries)
-		n.commitIndex = args.LeaderCommit
-		if lastNewIdx < n.commitIndex {
-			n.commitIndex = lastNewIdx
-		}
+	// Truncation can shrink the log below our previous commitIndex.
+	// Clamp — but never go below snapshotIndex.
+	if n.commitIndex > n.lastLogIndex() {
+		n.commitIndex = n.lastLogIndex()
+	}
+	if n.commitIndex < n.snapshotIndex {
+		n.commitIndex = n.snapshotIndex
 	}
 
+	// ── Rule 5: Advance commitIndex ───────────────────────────────────────
+	lastNewIdx := args.PrevLogIndex + len(args.Entries)
+	n.commitUpToLeader(args.LeaderCommit, lastNewIdx)
+
 	reply.Success = true
+	n.persist()
 	return nil
+}
+
+// commitUpToLeader sets commitIndex from LeaderCommit per Raft Figure 2.
+// lastNewIdx is the index of the last entry in this AppendEntries batch (may equal PrevLogIndex if empty).
+// Caller must hold n.mu.
+func (n *Node) commitUpToLeader(leaderCommit, lastNewIdx int) {
+	if leaderCommit <= n.commitIndex {
+		if n.commitIndex > n.lastLogIndex() {
+			n.commitIndex = n.lastLogIndex()
+		}
+		if n.commitIndex < n.snapshotIndex {
+			n.commitIndex = n.snapshotIndex
+		}
+		return
+	}
+	n.commitIndex = leaderCommit
+	if lastNewIdx < n.commitIndex {
+		n.commitIndex = lastNewIdx
+	}
+	if n.commitIndex > n.lastLogIndex() {
+		n.commitIndex = n.lastLogIndex()
+	}
+	if n.commitIndex < n.snapshotIndex {
+		n.commitIndex = n.snapshotIndex
+	}
 }

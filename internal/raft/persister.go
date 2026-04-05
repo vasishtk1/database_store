@@ -26,13 +26,22 @@ import (
 	bolt "go.etcd.io/bbolt"
 )
 
-// persistBucket is the BoltDB bucket name where we store the Raft state.
-// A bucket is like a namespace inside the BoltDB file.
+// persistBucket stores the three durable Raft fields (term, votedFor, log).
 var persistBucket = []byte("raft_state")
 
-// stateKey is the single key inside the bucket that holds the full state blob.
-// We store everything as one JSON document for simplicity.
+// snapshotBucket stores the latest snapshot (KV data + metadata).
+// Using a separate bucket keeps snapshot data isolated from the Raft state
+// and makes it easy to load/replace without touching the rest.
+var snapshotBucket = []byte("raft_snapshot")
+
+// stateKey is the single key inside persistBucket.
 var stateKey = []byte("state")
+
+// snapDataKey holds the raw KV map bytes.
+var snapDataKey = []byte("snap_data")
+
+// snapMetaKey holds the snapshot metadata (index + term) as JSON.
+var snapMetaKey = []byte("snap_meta")
 
 // durableState is the struct we serialize to disk. Exported fields are
 // required for encoding/json to pick them up.
@@ -40,6 +49,10 @@ type durableState struct {
 	CurrentTerm int        `json:"current_term"`
 	VotedFor    string     `json:"voted_for"`
 	Log         []LogEntry `json:"log"`
+	// CommitIndex is the highest log index known committed (majority replicated).
+	// Persisted so after a crash we can re-apply committed entries to the state machine
+	// before any new RPCs arrive.
+	CommitIndex int `json:"commit_index"`
 }
 
 // Persister wraps a BoltDB database and exposes save / load operations
@@ -61,7 +74,11 @@ func openPersister(path string) (*Persister, error) {
 	// db.Update runs a read-write transaction. We use it to create the
 	// bucket if this is the first time we've opened the file.
 	err = db.Update(func(tx *bolt.Tx) error {
-		_, err := tx.CreateBucketIfNotExists(persistBucket)
+		if _, err := tx.CreateBucketIfNotExists(persistBucket); err != nil {
+			return err
+		}
+		// Also create the snapshot bucket so it's always available.
+		_, err := tx.CreateBucketIfNotExists(snapshotBucket)
 		return err
 	})
 	if err != nil {
@@ -79,11 +96,12 @@ func openPersister(path string) (*Persister, error) {
 // from Week 1: disk is always at least as up-to-date as memory.
 //
 // Must be called with the Node's mutex held (caller's responsibility).
-func (p *Persister) save(term int, votedFor string, log []LogEntry) error {
+func (p *Persister) save(term int, votedFor string, log []LogEntry, commitIndex int) error {
 	state := durableState{
 		CurrentTerm: term,
 		VotedFor:    votedFor,
 		Log:         log,
+		CommitIndex: commitIndex,
 	}
 
 	data, err := json.Marshal(state)
@@ -101,8 +119,8 @@ func (p *Persister) save(term int, votedFor string, log []LogEntry) error {
 
 // load reads the previously saved state from disk.
 // On a brand-new node (no file yet) it returns zero values: term=0,
-// votedFor="", log=nil. The caller (node.go) handles the nil log case.
-func (p *Persister) load() (term int, votedFor string, log []LogEntry, err error) {
+// votedFor="", log=nil, commitIndex=0. The caller (node.go) handles the nil log case.
+func (p *Persister) load() (term int, votedFor string, log []LogEntry, commitIndex int, err error) {
 	var data []byte
 
 	// db.View is a read-only transaction.
@@ -117,20 +135,94 @@ func (p *Persister) load() (term int, votedFor string, log []LogEntry, err error
 		return nil
 	})
 	if err != nil {
-		return 0, "", nil, fmt.Errorf("bolt view: %w", err)
+		return 0, "", nil, 0, fmt.Errorf("bolt view: %w", err)
 	}
 
 	// No data yet — this is a fresh node.
 	if data == nil {
-		return 0, "", nil, nil
+		return 0, "", nil, 0, nil
 	}
 
 	var state durableState
 	if err = json.Unmarshal(data, &state); err != nil {
-		return 0, "", nil, fmt.Errorf("unmarshal raft state: %w", err)
+		return 0, "", nil, 0, fmt.Errorf("unmarshal raft state: %w", err)
 	}
 
-	return state.CurrentTerm, state.VotedFor, state.Log, nil
+	return state.CurrentTerm, state.VotedFor, state.Log, state.CommitIndex, nil
+}
+
+// ── Snapshot persistence ──────────────────────────────────────────────────────
+
+// snapshotMeta is the small metadata record stored alongside the raw snapshot data.
+type snapshotMeta struct {
+	LastIncludedIndex int `json:"last_included_index"`
+	LastIncludedTerm  int `json:"last_included_term"`
+}
+
+// saveSnapshot writes the full snapshot to BoltDB atomically.
+// data    — serialised KV store state (JSON map[string]string)
+// index   — the last log index covered by this snapshot (lastIncludedIndex)
+// term    — the term of that log entry (lastIncludedTerm)
+//
+// Both data and metadata are written in a single transaction so there is
+// never a state where one exists without the other.
+func (p *Persister) saveSnapshot(data []byte, index, term int) error {
+	meta := snapshotMeta{LastIncludedIndex: index, LastIncludedTerm: term}
+	metaBytes, err := json.Marshal(meta)
+	if err != nil {
+		return fmt.Errorf("marshal snapshot meta: %w", err)
+	}
+
+	return p.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(snapshotBucket)
+		if err := b.Put(snapMetaKey, metaBytes); err != nil {
+			return fmt.Errorf("write snap meta: %w", err)
+		}
+		if err := b.Put(snapDataKey, data); err != nil {
+			return fmt.Errorf("write snap data: %w", err)
+		}
+		return nil
+	})
+}
+
+// loadSnapshot reads the most recently saved snapshot from BoltDB.
+// Returns (nil, 0, 0, nil) if no snapshot has been saved yet — this is
+// the normal case on a fresh node and is NOT an error.
+func (p *Persister) loadSnapshot() (data []byte, index, term int, err error) {
+	var metaBytes, snapData []byte
+
+	err = p.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(snapshotBucket)
+
+		// BoltDB memory is only valid inside the transaction — copy both.
+		v := b.Get(snapMetaKey)
+		if v != nil {
+			metaBytes = make([]byte, len(v))
+			copy(metaBytes, v)
+		}
+
+		v = b.Get(snapDataKey)
+		if v != nil {
+			snapData = make([]byte, len(v))
+			copy(snapData, v)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, 0, 0, fmt.Errorf("bolt view snapshot: %w", err)
+	}
+
+	// No snapshot saved yet — fresh node.
+	if metaBytes == nil {
+		return nil, 0, 0, nil
+	}
+
+	var meta snapshotMeta
+	if err = json.Unmarshal(metaBytes, &meta); err != nil {
+		return nil, 0, 0, fmt.Errorf("unmarshal snapshot meta: %w", err)
+	}
+
+	return snapData, meta.LastIncludedIndex, meta.LastIncludedTerm, nil
 }
 
 // close flushes and closes the underlying BoltDB file.

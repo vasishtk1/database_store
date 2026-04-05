@@ -74,6 +74,17 @@ func (n *Node) startElection() {
 	totalNodes  := len(peerIDs) + 1       // us + peers
 	votesNeeded := totalNodes/2 + 1       // strict majority
 
+	// ── Immediate majority (single-node cluster) ────────────────────────────
+	// With zero peers, votesNeeded is 1 and only our self-vote counts. No
+	// RequestVote RPCs are sent, so we must win the election here.
+	n.mu.Lock()
+	if n.role == Candidate && n.currentTerm == term && votes >= votesNeeded {
+		wonElection = true
+		n.becomeLeader()
+		go n.runHeartbeatLoop()
+	}
+	n.mu.Unlock()
+
 	// ── Send RequestVote to every peer in parallel ────────────────────────
 	for _, peerID := range peerIDs {
 		peerID := peerID // capture loop variable for the goroutine

@@ -6,47 +6,121 @@
 //	GET key         → responds with the value, or "NULL" if not found
 //	DELETE key      → removes the key, responds "OK"
 //
-// Each client connection is handled in its own goroutine, so many
-// clients can be served concurrently without blocking each other.
+// ── Week 1 vs Week 2+ behaviour ──────────────────────────────────────────────
 //
-// In Week 2, when we add Raft, writes (PUT, DELETE) will no longer
-// apply directly to the store here. Instead they'll be forwarded to
-// the Raft leader, which will replicate them to a majority of nodes
-// before the state machine applies them. The protocol stays the same
-// from the client's perspective.
+// When a Raft node is wired in (raftNode != nil):
+//   - PUT / DELETE are forwarded to Raft via Submit(). The server blocks
+//     until the entry is committed and applied, then returns "OK".
+//   - If this node is not the Raft leader, it returns "ERR not leader"
+//     so the client can retry against another node.
+//   - GET reads directly from the local in-memory store (eventually
+//     consistent — followers may lag by a heartbeat or two).
+//
+// When raftNode is nil (single-node / Week 1 mode):
+//   - PUT / DELETE go directly to the WAL + store, as in Week 1.
+//
+// ── Apply loop ───────────────────────────────────────────────────────────────
+//
+// RunApplyLoop() must be called once after New(). It reads committed entries
+// from the Raft applyCh channel and applies them to the store. It also
+// triggers a snapshot every snapshotEvery entries to keep the log compact.
 
 // A Go dictionary that stores words mapped to other words using a mutex lock
-// mutex lock: mechanism that ensures only one thread accesses a shared resoruce at a time
+// mutex lock: mechanism that ensures only one thread accesses a shared resource at a time
 // prevents data corruption
 
-// listens for incoming connectoins on a port
-// each client gets its own go routine
+// listens for incoming connections on a port
+// each client gets its own goroutine
 
 package server
 
 import (
 	"bufio"
 	"fmt"
+	"log"
 	"net"
 	"strings"
 
+	"database_store/internal/raft"
 	"database_store/internal/store"
 	"database_store/internal/wal"
 )
 
+// snapshotEvery controls how often we compact the Raft log. After this many
+// applied entries, the server serialises the store and calls TakeSnapshot().
+// 100 is small enough to test easily; in production you'd use 10_000+.
+const snapshotEvery = 100
+
 // Server holds everything needed to accept and handle client connections.
 type Server struct {
-	addr  string       // TCP address to listen on, e.g. ":8080"
-	store *store.Store // the in-memory state machine
-	wal   *wal.WAL     // the write-ahead log for durability
+	addr     string       // TCP address to listen on, e.g. ":8080"
+	store    *store.Store // the in-memory state machine
+	wal      *wal.WAL     // the write-ahead log (Week 1 / single-node only)
+	raftNode *raft.Node   // nil in single-node (Week 1) mode
 }
 
-// New creates a Server. It does not start listening yet — call Start() for that.
-func New(addr string, s *store.Store, w *wal.WAL) *Server {
-	return &Server{addr: addr, store: s, wal: w}
+// New creates a Server. Call Start() to begin accepting connections.
+// raftNode may be nil for single-node (Week 1) operation.
+func New(addr string, s *store.Store, w *wal.WAL, r *raft.Node) *Server {
+	return &Server{addr: addr, store: s, wal: w, raftNode: r}
 }
 
-// Start binds to srv.addr and blocks, accepting client connections.
+// RunApplyLoop reads committed entries from applyCh and applies them to the
+// store. Must be called once in its own goroutine BEFORE Start().
+//
+// It also handles snapshot ApplyMsgs: when IsSnapshot=true it restores the
+// entire store from the snapshot bytes instead of applying a single entry.
+// Every snapshotEvery applied entries it tells Raft to compact the log.
+func (srv *Server) RunApplyLoop(applyCh <-chan raft.ApplyMsg) {
+	go func() {
+		entriesSinceSnapshot := 0
+
+		for msg := range applyCh {
+			// ── Snapshot install ──────────────────────────────────────────
+			// Sent on startup (loaded from disk) or when the leader ships a
+			// full snapshot because this node fell too far behind.
+			if msg.IsSnapshot {
+				if err := srv.store.LoadSnapshot(msg.Snapshot); err != nil {
+					log.Printf("[server] LoadSnapshot error: %v", err)
+				} else {
+					log.Printf("[server] snapshot installed | index=%d", msg.SnapshotIndex)
+				}
+				entriesSinceSnapshot = 0
+				continue
+			}
+
+			// ── Normal log entry ──────────────────────────────────────────
+			switch msg.Op {
+			case "PUT":
+				srv.store.Put(msg.Key, msg.Value)
+			case "DELETE":
+				srv.store.Delete(msg.Key)
+			default:
+				log.Printf("[server] unknown op in ApplyMsg: %q", msg.Op)
+				continue
+			}
+
+			entriesSinceSnapshot++
+
+			// ── Snapshot trigger ──────────────────────────────────────────
+			// Every snapshotEvery applied entries, serialise the store and
+			// hand the bytes to Raft. Raft will compact its log and save the
+			// snapshot to disk so restarts and lagging followers can use it.
+			if srv.raftNode != nil && entriesSinceSnapshot >= snapshotEvery {
+				data, err := srv.store.Snapshot()
+				if err != nil {
+					log.Printf("[server] snapshot error: %v", err)
+				} else {
+					srv.raftNode.TakeSnapshot(data, msg.Index)
+					entriesSinceSnapshot = 0
+					log.Printf("[server] triggered snapshot at index=%d", msg.Index)
+				}
+			}
+		}
+	}()
+}
+
+// Start binds to the TCP address and blocks, accepting client connections.
 // Each accepted connection is handed off to handleConn in a new goroutine.
 func (srv *Server) Start() error {
 	ln, err := net.Listen("tcp", srv.addr)
@@ -68,14 +142,15 @@ func (srv *Server) Serve(ln net.Listener) error {
 			return fmt.Errorf("accept: %w", err)
 		}
 
+		// Spin up a goroutine per connection — cheap in Go and keeps
+		// the accept loop free to handle the next incoming client.
 		go srv.handleConn(conn)
 	}
 }
 
 // handleConn reads commands from one client until it disconnects.
-// bufio.Scanner handles the line-splitting for us.
 func (srv *Server) handleConn(conn net.Conn) {
-	defer conn.Close() // always close the connection when we're done
+	defer conn.Close()
 
 	scanner := bufio.NewScanner(conn)
 	for scanner.Scan() {
@@ -83,22 +158,14 @@ func (srv *Server) handleConn(conn net.Conn) {
 		if line == "" {
 			continue
 		}
-
 		response := srv.dispatch(line)
-
-		// Write the response back. fmt.Fprintf writes directly to the
-		// TCP connection — the client reads it as a newline-terminated string.
 		fmt.Fprintf(conn, "%s\n", response)
 	}
-	// scanner.Scan() returns false on EOF (client disconnected) or error.
-	// Either way we just return, and defer closes the connection.
 }
 
 // dispatch parses a command string and routes it to the right handler.
-// Returns the string that should be sent back to the client.
 func (srv *Server) dispatch(line string) string {
-	// SplitN with n=3 means: split into at most 3 parts.
-	// This lets values contain spaces: "PUT key hello world" → ["PUT", "key", "hello world"]
+	// SplitN(3) lets values contain spaces: "PUT key hello world" → ["PUT","key","hello world"]
 	parts := strings.SplitN(line, " ", 3)
 	cmd := strings.ToUpper(parts[0])
 
@@ -108,19 +175,16 @@ func (srv *Server) dispatch(line string) string {
 			return "ERR usage: PUT <key> <value>"
 		}
 		return srv.handlePut(parts[1], parts[2])
-
 	case "GET":
 		if len(parts) < 2 {
 			return "ERR usage: GET <key>"
 		}
 		return srv.handleGet(parts[1])
-
 	case "DELETE":
 		if len(parts) < 2 {
 			return "ERR usage: DELETE <key>"
 		}
 		return srv.handleDelete(parts[1])
-
 	default:
 		return fmt.Sprintf("ERR unknown command %q", cmd)
 	}
@@ -128,10 +192,22 @@ func (srv *Server) dispatch(line string) string {
 
 // handlePut persists and applies a PUT operation.
 func (srv *Server) handlePut(key, value string) string {
-	// Write to WAL FIRST. If we crash after this line but before
-	// store.Put(), the WAL replay on restart will re-apply the PUT.
-	// If we crash before this line, neither disk nor memory has the
-	// value — the client will get an error and can retry.
+	// ── Raft mode (Week 2+) ───────────────────────────────────────────────
+	if srv.raftNode != nil {
+		idx, _, isLeader := srv.raftNode.Submit("PUT", key, value)
+		if !isLeader {
+			return "ERR not leader"
+		}
+		// Block until the entry is committed and applied to the store.
+		// Timeout after 5 seconds — generous for a local cluster.
+		if !srv.raftNode.WaitForApply(idx, 5000) {
+			return "ERR timeout waiting for commit"
+		}
+		return "OK"
+	}
+
+	// ── Single-node mode (Week 1) ─────────────────────────────────────────
+	// Write to WAL FIRST, then apply to store.
 	if err := srv.wal.Append(wal.Entry{Op: wal.OpPut, Key: key, Value: value}); err != nil {
 		return fmt.Sprintf("ERR wal append: %v", err)
 	}
@@ -139,7 +215,7 @@ func (srv *Server) handlePut(key, value string) string {
 	return "OK"
 }
 
-// handleGet looks up a key. Reads don't touch the WAL — they're not mutations.
+// handleGet looks up a key. Reads never go through Raft — served locally.
 func (srv *Server) handleGet(key string) string {
 	val, ok := srv.store.Get(key)
 	if !ok {
@@ -150,7 +226,19 @@ func (srv *Server) handleGet(key string) string {
 
 // handleDelete persists and applies a DELETE operation.
 func (srv *Server) handleDelete(key string) string {
-	// Same WAL-first discipline as PUT.
+	// ── Raft mode ─────────────────────────────────────────────────────────
+	if srv.raftNode != nil {
+		idx, _, isLeader := srv.raftNode.Submit("DELETE", key, "")
+		if !isLeader {
+			return "ERR not leader"
+		}
+		if !srv.raftNode.WaitForApply(idx, 5000) {
+			return "ERR timeout waiting for commit"
+		}
+		return "OK"
+	}
+
+	// ── Single-node mode ──────────────────────────────────────────────────
 	if err := srv.wal.Append(wal.Entry{Op: wal.OpDelete, Key: key}); err != nil {
 		return fmt.Sprintf("ERR wal append: %v", err)
 	}
