@@ -1,0 +1,601 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>KV Store Dashboard</title>
+
+  <!-- Chart.js from CDN — draws the commit index line chart -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+
+  <style>
+    /* ── Reset & base ─────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #0f1117;
+      --surface:   #1a1d27;
+      --border:    #2a2d3e;
+      --accent:    #6c63ff;
+      --green:     #22c55e;
+      --yellow:    #eab308;
+      --red:       #ef4444;
+      --text:      #e2e8f0;
+      --muted:     #64748b;
+      --radius:    10px;
+      --font:      'Inter', system-ui, sans-serif;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 14px;
+      line-height: 1.5;
+      min-height: 100vh;
+      padding: 24px;
+    }
+
+    h1 { font-size: 1.4rem; font-weight: 700; letter-spacing: -0.3px; }
+    h2 { font-size: 0.8rem; font-weight: 600; text-transform: uppercase;
+         letter-spacing: 1px; color: var(--muted); margin-bottom: 12px; }
+
+    /* ── Layout ───────────────────────────────────────────────────── */
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 24px;
+    }
+
+    .header-right {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .poll-badge {
+      font-size: 11px;
+      color: var(--muted);
+      padding: 4px 10px;
+      border: 1px solid var(--border);
+      border-radius: 20px;
+    }
+
+    .pulse {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: var(--green);
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: 0.3; }
+    }
+
+    /* Main grid: nodes row, then chart+ops side-by-side, then KV browser */
+    .grid-nodes {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 16px;
+      margin-bottom: 20px;
+    }
+
+    .grid-lower {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      margin-bottom: 20px;
+    }
+
+    /* ── Card ─────────────────────────────────────────────────────── */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 18px;
+    }
+
+    /* ── Node card ────────────────────────────────────────────────── */
+    .node-card .node-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 14px;
+    }
+
+    .node-id { font-size: 1rem; font-weight: 700; }
+
+    .role-badge {
+      font-size: 11px;
+      font-weight: 600;
+      padding: 3px 10px;
+      border-radius: 20px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .role-Leader    { background: rgba(108,99,255,.25); color: #a5b4fc; border: 1px solid #6c63ff44; }
+    .role-Follower  { background: rgba(34,197,94,.15);  color: #86efac; border: 1px solid #22c55e33; }
+    .role-Candidate { background: rgba(234,179,8,.15);  color: #fde68a; border: 1px solid #eab30833; }
+    .role-unknown   { background: rgba(100,116,139,.2); color: var(--muted); border: 1px solid var(--border); }
+
+    .stat-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+
+    .stat {
+      background: rgba(255,255,255,.03);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px 10px;
+    }
+    .stat-label { font-size: 10px; color: var(--muted); margin-bottom: 2px; }
+    .stat-value { font-size: 1rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+
+    /* peer sync indicators on the leader card */
+    .peers-section { margin-top: 12px; }
+    .peer-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 5px 0;
+      border-top: 1px solid var(--border);
+      font-size: 12px;
+    }
+    .sync-dot {
+      width: 7px; height: 7px;
+      border-radius: 50%;
+      display: inline-block;
+      margin-right: 6px;
+    }
+    .dot-green { background: var(--green); }
+    .dot-yellow { background: var(--yellow); }
+
+    /* ── Chart card ───────────────────────────────────────────────── */
+    .chart-card canvas { width: 100% !important; }
+
+    /* ── Ops feed ─────────────────────────────────────────────────── */
+    .ops-list {
+      max-height: 300px;
+      overflow-y: auto;
+      scrollbar-width: thin;
+      scrollbar-color: var(--border) transparent;
+    }
+
+    .op-row {
+      display: grid;
+      grid-template-columns: 56px 56px 1fr 60px;
+      gap: 6px;
+      padding: 6px 0;
+      border-bottom: 1px solid var(--border);
+      font-size: 12px;
+      font-family: 'JetBrains Mono', 'Fira Code', monospace;
+      align-items: center;
+    }
+    .op-row:last-child { border-bottom: none; }
+
+    .op-time   { color: var(--muted); }
+    .op-method { font-weight: 700; }
+    .method-GET    { color: #38bdf8; }
+    .method-PUT    { color: #a78bfa; }
+    .method-DELETE { color: var(--red); }
+
+    .op-key { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+    .op-result { font-weight: 600; text-align: right; }
+    .result-ok          { color: var(--green); }
+    .result-not_found   { color: var(--muted); }
+    .result-not_leader  { color: var(--yellow); }
+    .result-timeout     { color: var(--red); }
+
+    .no-ops { color: var(--muted); font-size: 12px; text-align: center; padding: 24px 0; }
+
+    /* ── KV browser ───────────────────────────────────────────────── */
+    .kv-section { }
+
+    .kv-form {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 14px;
+      flex-wrap: wrap;
+    }
+
+    input, select {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      padding: 7px 10px;
+      font-size: 13px;
+      outline: none;
+      transition: border-color .15s;
+    }
+    input:focus, select:focus { border-color: var(--accent); }
+    input::placeholder { color: var(--muted); }
+
+    input.key-input   { flex: 1; min-width: 100px; }
+    input.val-input   { flex: 2; min-width: 120px; }
+    select.op-select  { width: 90px; }
+
+    button {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      padding: 7px 16px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity .15s;
+    }
+    button:hover { opacity: .85; }
+    button.btn-danger { background: var(--red); }
+    button.btn-ghost  { background: transparent; border: 1px solid var(--border); color: var(--text); }
+
+    /* Port selector */
+    .port-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 14px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    /* KV result box */
+    #kv-result {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 12px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 12px;
+      min-height: 60px;
+      white-space: pre-wrap;
+      word-break: break-all;
+      color: var(--text);
+    }
+    #kv-result.error  { color: var(--red); }
+    #kv-result.ok     { color: var(--green); }
+    #kv-result.muted  { color: var(--muted); }
+  </style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>KV Store Dashboard</h1>
+    <div style="color:var(--muted);font-size:12px;margin-top:2px;">Distributed Raft cluster — 3 nodes</div>
+  </div>
+  <div class="header-right">
+    <span class="poll-badge">Polling every 1.5 s</span>
+    <div class="pulse" id="pulse"></div>
+  </div>
+</header>
+
+<!-- ── Node cards ──────────────────────────────────────────────── -->
+<div class="grid-nodes" id="nodes-grid">
+  <!-- filled by renderNodes() -->
+</div>
+
+<!-- ── Commit index chart + ops feed ──────────────────────────── -->
+<div class="grid-lower">
+
+  <div class="card chart-card">
+    <h2>Commit Index</h2>
+    <canvas id="commitChart" height="180"></canvas>
+  </div>
+
+  <div class="card">
+    <h2>Recent Operations</h2>
+    <div class="ops-list" id="ops-list">
+      <div class="no-ops">No operations yet</div>
+    </div>
+  </div>
+
+</div>
+
+<!-- ── KV browser ──────────────────────────────────────────────── -->
+<div class="card kv-section">
+  <h2>Key-Value Browser</h2>
+
+  <div class="port-row">
+    Target node:
+    <select id="target-port">
+      <option value="9001">node1 :9001</option>
+      <option value="9002">node2 :9002</option>
+      <option value="9003">node3 :9003</option>
+    </select>
+    <span id="target-role" style="margin-left:4px;"></span>
+  </div>
+
+  <div class="kv-form">
+    <select class="op-select" id="op-select">
+      <option value="GET">GET</option>
+      <option value="PUT">PUT</option>
+      <option value="DELETE">DELETE</option>
+    </select>
+    <input class="key-input" id="kv-key" type="text" placeholder="key" />
+    <input class="val-input" id="kv-val" type="text" placeholder="value (PUT only)" />
+    <button onclick="runKVOp()">Send</button>
+  </div>
+
+  <pre id="kv-result" class="muted">Result will appear here…</pre>
+</div>
+
+<script>
+// ── Configuration ────────────────────────────────────────────────
+// Node IDs and their HTTP API ports.
+const NODES = [
+  { id: 'node1', port: 9001 },
+  { id: 'node2', port: 9002 },
+  { id: 'node3', port: 9003 },
+];
+
+const POLL_MS = 1500; // how often to fetch /metrics from each node
+
+// ── State ────────────────────────────────────────────────────────
+// Latest metrics snapshot from each node (null if unreachable).
+let nodeState = {};          // port → metricsResponse | null
+let commitHistory = {};      // port → [commitIndex, ...]   (last 40 samples)
+let historyTs    = [];       // shared timestamp labels (HH:MM:SS)
+
+NODES.forEach(n => {
+  nodeState[n.port]    = null;
+  commitHistory[n.port] = [];
+});
+
+// ── Chart setup ──────────────────────────────────────────────────
+const chartCtx = document.getElementById('commitChart').getContext('2d');
+const commitChart = new Chart(chartCtx, {
+  type: 'line',
+  data: {
+    labels: [],
+    datasets: NODES.map((n, i) => ({
+      label: n.id,
+      data: [],
+      borderColor: ['#6c63ff', '#22c55e', '#38bdf8'][i],
+      backgroundColor: 'transparent',
+      tension: 0.3,
+      pointRadius: 2,
+      borderWidth: 2,
+    })),
+  },
+  options: {
+    animation: false,
+    responsive: true,
+    interaction: { intersect: false, mode: 'index' },
+    plugins: { legend: { labels: { color: '#94a3b8', boxWidth: 12, font: { size: 11 } } } },
+    scales: {
+      x: { ticks: { color: '#475569', font: { size: 10 }, maxTicksLimit: 8 },
+           grid: { color: '#1e2234' } },
+      y: { ticks: { color: '#475569', font: { size: 10 } },
+           grid: { color: '#1e2234' }, beginAtZero: true },
+    },
+  },
+});
+
+const MAX_HISTORY = 40;
+
+// ── Polling ──────────────────────────────────────────────────────
+async function fetchMetrics(port) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 1200);
+  try {
+    const resp = await fetch(`http://localhost:${port}/metrics`, { signal: ctrl.signal });
+    clearTimeout(t);
+    if (!resp.ok) return null;
+    return await resp.json();
+  } catch {
+    clearTimeout(t);
+    return null;
+  }
+}
+
+async function poll() {
+  // Fetch all three nodes concurrently.
+  const results = await Promise.all(NODES.map(n => fetchMetrics(n.port)));
+
+  const ts = new Date().toLocaleTimeString('en-GB', { hour12: false });
+  historyTs.push(ts);
+  if (historyTs.length > MAX_HISTORY) historyTs.shift();
+
+  NODES.forEach((n, i) => {
+    nodeState[n.port] = results[i];
+    const raw = results[i]?.raft?.commit_index;
+    const hist = commitHistory[n.port];
+    const prev = hist.length ? hist[hist.length - 1] : 0;
+    // Keep numeric samples for Chart.js (avoid null when a node is briefly unreachable).
+    const ci = raw != null ? raw : prev;
+    hist.push(ci);
+    if (hist.length > MAX_HISTORY) hist.shift();
+  });
+
+  // Blink the pulse dot to show we're alive.
+  const pulse = document.getElementById('pulse');
+  pulse.style.background = '#6c63ff';
+  setTimeout(() => { pulse.style.background = '#22c55e'; }, 300);
+
+  renderNodes();
+  renderChart();
+  renderOps();
+  updateTargetRole();
+}
+
+// ── Render: node cards ───────────────────────────────────────────
+function renderNodes() {
+  const grid = document.getElementById('nodes-grid');
+  grid.innerHTML = '';
+
+  NODES.forEach(n => {
+    const m  = nodeState[n.port];
+    const r  = m?.raft;
+    const up = m != null;
+
+    const role = up ? (r?.role ?? 'unknown') : 'offline';
+    const term = up ? (r?.term ?? '–')        : '–';
+    const ci   = up ? (r?.commit_index ?? '–'): '–';
+    const la   = up ? (r?.last_applied  ?? '–'): '–';
+    const snap = up ? (r?.snapshot_index ?? '–'): '–';
+    const logL = up ? (r?.log_length ?? '–')  : '–';
+
+    // Peer sync rows (only shown when this node is Leader).
+    let peersHTML = '';
+    if (up && role === 'Leader' && r?.peers) {
+      peersHTML = '<div class="peers-section">';
+      for (const [pid, pm] of Object.entries(r.peers)) {
+        const dotClass = pm.in_sync ? 'dot-green' : 'dot-yellow';
+        peersHTML += `
+          <div class="peer-row">
+            <span><span class="sync-dot ${dotClass}"></span>${pid}</span>
+            <span style="color:var(--muted)">match&nbsp;${pm.match_index}&nbsp;/&nbsp;next&nbsp;${pm.next_index}</span>
+          </div>`;
+      }
+      peersHTML += '</div>';
+    }
+
+    // Uptime
+    const uptimeStr = up ? formatUptime(m.uptime_s) : 'offline';
+
+    grid.innerHTML += `
+      <div class="card node-card">
+        <div class="node-header">
+          <span class="node-id">${n.id}</span>
+          <span class="role-badge role-${role}">${role}</span>
+        </div>
+        <div class="stat-grid">
+          <div class="stat"><div class="stat-label">Term</div><div class="stat-value">${term}</div></div>
+          <div class="stat"><div class="stat-label">Commit</div><div class="stat-value">${ci}</div></div>
+          <div class="stat"><div class="stat-label">Applied</div><div class="stat-value">${la}</div></div>
+          <div class="stat"><div class="stat-label">Snapshot</div><div class="stat-value">${snap}</div></div>
+          <div class="stat"><div class="stat-label">Log entries</div><div class="stat-value">${logL}</div></div>
+          <div class="stat"><div class="stat-label">Uptime</div><div class="stat-value" style="font-size:.8rem">${uptimeStr}</div></div>
+        </div>
+        ${peersHTML}
+      </div>`;
+  });
+}
+
+// ── Render: commit chart ─────────────────────────────────────────
+function renderChart() {
+  commitChart.data.labels = [...historyTs];
+  NODES.forEach((n, i) => {
+    commitChart.data.datasets[i].data = [...commitHistory[n.port]];
+  });
+  commitChart.update('none');
+}
+
+// ── Render: ops feed ─────────────────────────────────────────────
+// Collect recent_ops from every reachable node and show the latest 50.
+function renderOps() {
+  // Gather all ops from all nodes, deduplicate by time+method+key, sort newest-first.
+  const seen  = new Set();
+  const allOps = [];
+
+  NODES.forEach(n => {
+    const ops = nodeState[n.port]?.recent_ops ?? [];
+    ops.forEach(op => {
+      const key = `${op.time}|${op.method}|${op.key}|${op.result}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        allOps.push(op);
+      }
+    });
+  });
+
+  // Sort descending by time string (HH:MM:SS lexicographic is fine within a day).
+  allOps.sort((a, b) => b.time.localeCompare(a.time));
+  const display = allOps.slice(0, 50);
+
+  const list = document.getElementById('ops-list');
+  if (display.length === 0) {
+    list.innerHTML = '<div class="no-ops">No operations yet</div>';
+    return;
+  }
+
+  list.innerHTML = display.map(op => {
+    const valStr = op.value ? ` = ${op.value}` : '';
+    return `
+      <div class="op-row">
+        <span class="op-time">${op.time}</span>
+        <span class="op-method method-${op.method}">${op.method}</span>
+        <span class="op-key">${op.key}${valStr}</span>
+        <span class="op-result result-${op.result}">${op.result}</span>
+      </div>`;
+  }).join('');
+}
+
+// ── KV browser ───────────────────────────────────────────────────
+function updateTargetRole() {
+  const port = parseInt(document.getElementById('target-port').value, 10);
+  const m = nodeState[port];
+  const role = m?.raft?.role ?? 'unknown';
+  const span = document.getElementById('target-role');
+  span.className = `role-badge role-${role}`;
+  span.textContent = role;
+}
+
+document.getElementById('op-select').addEventListener('change', e => {
+  document.getElementById('kv-val').disabled = (e.target.value !== 'PUT');
+});
+
+async function runKVOp() {
+  const port   = parseInt(document.getElementById('target-port').value, 10);
+  const op     = document.getElementById('op-select').value;
+  const key    = document.getElementById('kv-key').value.trim();
+  const value  = document.getElementById('kv-val').value.trim();
+  const result = document.getElementById('kv-result');
+
+  if (!key) {
+    result.textContent = 'Error: key must not be empty';
+    result.className = 'error';
+    return;
+  }
+
+  result.textContent = 'Sending…';
+  result.className = 'muted';
+
+  try {
+    let resp;
+    const url = `http://localhost:${port}/keys/${encodeURIComponent(key)}`;
+
+    if (op === 'GET') {
+      resp = await fetch(url);
+    } else if (op === 'PUT') {
+      resp = await fetch(url, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ value }),
+      });
+    } else {
+      resp = await fetch(url, { method: 'DELETE' });
+    }
+
+    const body = await resp.json();
+    result.textContent = JSON.stringify(body, null, 2);
+    result.className = resp.ok ? 'ok' : 'error';
+  } catch (err) {
+    result.textContent = `Network error: ${err.message}`;
+    result.className = 'error';
+  }
+}
+
+// ── Helpers ──────────────────────────────────────────────────────
+function formatUptime(s) {
+  if (s == null || s === '–') return '–';
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  if (h > 0)  return `${h}h ${m}m`;
+  if (m > 0)  return `${m}m ${sec}s`;
+  return `${sec}s`;
+}
+
+// ── Boot ─────────────────────────────────────────────────────────
+poll(); // immediate first fetch
+setInterval(poll, POLL_MS);
+</script>
+</body>
+</html>

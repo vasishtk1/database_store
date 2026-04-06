@@ -3,17 +3,20 @@
     {
       "id":        "node1",
       "raft_addr": "localhost:7001",
-      "kv_addr":   "localhost:8001"
+      "kv_addr":   "localhost:8001",
+      "http_addr": "localhost:9001"
     },
     {
       "id":        "node2",
       "raft_addr": "localhost:7002",
-      "kv_addr":   "localhost:8002"
+      "kv_addr":   "localhost:8002",
+      "http_addr": "localhost:9002"
     },
     {
       "id":        "node3",
       "raft_addr": "localhost:7003",
-      "kv_addr":   "localhost:8003"
+      "kv_addr":   "localhost:8003",
+      "http_addr": "localhost:9003"
     }
   ]
 }

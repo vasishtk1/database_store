@@ -21,6 +21,7 @@ import (
 	"math/rand"
 	"net"
 	"net/rpc"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -250,6 +251,8 @@ func (n *Node) Submit(op, key, value string) (index int, term int, isLeader bool
 		return -1, n.currentTerm, false
 	}
 
+	op = strings.ToUpper(strings.TrimSpace(op))
+
 	// Build the new log entry.
 	entry := LogEntry{
 		Index: n.lastLogIndex() + 1,
@@ -325,6 +328,61 @@ func (n *Node) WaitForApply(index int, timeoutMs int) bool {
 		}
 		time.Sleep(poll)
 	}
+}
+
+// ── Metrics ───────────────────────────────────────────────────────────────────
+
+// PeerMetrics is what the leader knows about one follower's replication state.
+type PeerMetrics struct {
+	MatchIndex int  `json:"match_index"` // highest log index known replicated on this peer
+	NextIndex  int  `json:"next_index"`  // next index the leader will send to this peer
+	InSync     bool `json:"in_sync"`     // true when matchIndex >= commitIndex
+}
+
+// NodeMetrics is a point-in-time snapshot of this node's Raft state.
+// Serialised to JSON by the /metrics HTTP endpoint and consumed by the dashboard.
+type NodeMetrics struct {
+	NodeID        string                 `json:"node_id"`
+	Role          string                 `json:"role"`
+	Term          int                    `json:"term"`
+	CommitIndex   int                    `json:"commit_index"`
+	LastApplied   int                    `json:"last_applied"`
+	SnapshotIndex int                    `json:"snapshot_index"`
+	LogLength     int                    `json:"log_length"` // real entries (after sentinel)
+	Peers         map[string]PeerMetrics `json:"peers"`      // only populated when Leader
+}
+
+// GetMetrics returns a snapshot of this node's current Raft state.
+// Safe to call from any goroutine.
+func (n *Node) GetMetrics() NodeMetrics {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	m := NodeMetrics{
+		NodeID:        n.id,
+		Role:          n.role.String(),
+		Term:          n.currentTerm,
+		CommitIndex:   n.commitIndex,
+		LastApplied:   n.lastApplied,
+		SnapshotIndex: n.snapshotIndex,
+		LogLength:     len(n.log) - 1,
+		Peers:         make(map[string]PeerMetrics),
+	}
+
+	// Only the leader has meaningful matchIndex / nextIndex for peers.
+	if n.role == Leader {
+		for id := range n.peers {
+			mi := n.matchIndex[id]
+			ni := n.nextIndex[id]
+			m.Peers[id] = PeerMetrics{
+				MatchIndex: mi,
+				NextIndex:  ni,
+				InSync:     mi >= n.commitIndex,
+			}
+		}
+	}
+
+	return m
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────────

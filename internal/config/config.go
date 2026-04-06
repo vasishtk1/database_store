@@ -19,11 +19,10 @@ import (
 // NodeConfig holds the addresses for a single node in the cluster.
 type NodeConfig struct {
 	// ID is the unique name for this node, e.g. "node1".
-	// Passed at startup with the --id flag.
 	ID string `json:"id"`
 
 	// RaftAddr is the TCP address this node's Raft RPC server listens on.
-	// Only other Raft nodes connect here — clients never use this port.
+	// Only other Raft nodes connect here — clients never touch this port.
 	// Example: "localhost:7001"
 	RaftAddr string `json:"raft_addr"`
 
@@ -31,6 +30,11 @@ type NodeConfig struct {
 	// This is the port kvctl talks to.
 	// Example: "localhost:8001"
 	KVAddr string `json:"kv_addr"`
+
+	// HTTPAddr is the TCP address for the HTTP/JSON API and dashboard.
+	// Exposes /keys/{key}, /status, /metrics, and serves the dashboard UI.
+	// Example: "localhost:9001"
+	HTTPAddr string `json:"http_addr"`
 }
 
 // ClusterConfig holds the full list of nodes in the cluster.

@@ -28,9 +28,11 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"path/filepath"
 
 	"database_store/internal/config"
+	"database_store/internal/httpapi"
 	"database_store/internal/raft"
 	"database_store/internal/server"
 	"database_store/internal/store"
@@ -117,7 +119,29 @@ func main() {
 	// It also triggers a snapshot every 100 entries via raftNode.TakeSnapshot().
 	srv.RunApplyLoop(applyCh)
 
-	// ── Step 8: Start TCP server (blocks until error) ─────────────────────
+	// ── Step 8: Start HTTP API + dashboard server ─────────────────────────
+	// Build the list of peer IDs for the /status endpoint.
+	peerIDs := make([]string, 0, len(peers))
+	for id := range peers {
+		peerIDs = append(peerIDs, id)
+	}
+
+	if self.HTTPAddr == "" {
+		log.Fatal("cluster config: http_addr is required for each node (HTTP API + dashboard)")
+	}
+
+	httpHandler := httpapi.New(s, raftNode, self.ID, peerIDs)
+	httpMux := http.NewServeMux()
+	httpHandler.Register(httpMux)
+
+	go func() {
+		log.Printf("node %s HTTP API + dashboard on %s", self.ID, self.HTTPAddr)
+		if err := http.ListenAndServe(self.HTTPAddr, httpMux); err != nil {
+			log.Fatalf("http server error: %v", err)
+		}
+	}()
+
+	// ── Step 9: Start TCP server (blocks until error) ─────────────────────
 	log.Printf("node %s ready — accepting KV clients on %s", self.ID, self.KVAddr)
 	if err := srv.Start(); err != nil {
 		log.Fatalf("server error: %v", err)
