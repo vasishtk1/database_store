@@ -1,19 +1,11 @@
-// kvctl is the command-line client for the KV store.
-//
-// It connects to a running server over TCP, sends one command,
-// prints the response, and exits. Think of it like the redis-cli
-// equivalent for our store.
-//
+// kvctl is the commnand line client in order to interact with the KV store
 // Usage:
 //
 //	kvctl get <key>
 //	kvctl put <key> <value>
 //	kvctl delete <key>
-//
-// The --server flag (default localhost:8080) points at the running server.
-// Example: kvctl --server localhost:9000 get mykey
-
-// opens a TCP connetion to the server, sends a comnand, reads a respond and then closes connection
+// default localhost: 8080
+// opens a TCP connetion to the server, sends a comnand, reads a response and then closes connection
 package main
 
 import (
@@ -26,15 +18,10 @@ import (
 )
 
 // serverAddr holds the address of the KV server to connect to.
-// It is set by the --server persistent flag on the root command.
 var serverAddr string
 
 // sendCommand opens a TCP connection to serverAddr, sends one command line,
 // reads back the single-line response, and closes the connection.
-//
-// Opening a fresh connection per command keeps the client stateless and
-// simple. In a production client you'd pool connections for performance,
-// but that complexity isn't needed here.
 func sendCommand(command string) (string, error) {
 	conn, err := net.Dial("tcp", serverAddr)
 	if err != nil {
@@ -42,7 +29,6 @@ func sendCommand(command string) (string, error) {
 	}
 	defer conn.Close()
 
-	// Send the command followed by a newline — the server reads line by line.
 	fmt.Fprintf(conn, "%s\n", command)
 
 	// Read exactly one response line back from the server.
@@ -57,7 +43,6 @@ func sendCommand(command string) (string, error) {
 }
 
 func main() {
-	// rootCmd is the top-level "kvctl" command.
 	// Cobra automatically generates --help output for every command.
 	rootCmd := &cobra.Command{
 		Use:   "kvctl",
@@ -94,9 +79,6 @@ func main() {
 		Short: "Set a key to a value",
 		Args:  cobra.ExactArgs(2),
 		Run: func(cmd *cobra.Command, args []string) {
-			// args[0] = key, args[1] = value
-			// Cobra joins the two positional args; the server's SplitN(3)
-			// correctly handles values that contain spaces passed as one arg.
 			resp, err := sendCommand("PUT " + args[0] + " " + args[1])
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "Error:", err)
