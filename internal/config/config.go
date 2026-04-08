@@ -5,9 +5,6 @@
 //   - What port to listen on for Raft RPCs (raft_addr)
 //   - What port to expose for client KV commands (kv_addr)
 //   - Who all the other nodes are (so it can dial them for Raft)
-//
-// Every node in the cluster reads the SAME config file. The node just
-// uses its --id flag to find its own row and treat the rest as peers.
 package config
 
 import (
@@ -18,22 +15,15 @@ import (
 
 // NodeConfig holds the addresses for a single node in the cluster.
 type NodeConfig struct {
-	// ID is the unique name for this node, e.g. "node1".
 	ID string `json:"id"`
 
 	// RaftAddr is the TCP address this node's Raft RPC server listens on.
-	// Only other Raft nodes connect here — clients never touch this port.
-	// Example: "localhost:7001"
 	RaftAddr string `json:"raft_addr"`
 
 	// KVAddr is the TCP address clients connect to for GET/PUT/DELETE commands.
-	// This is the port kvctl talks to.
-	// Example: "localhost:8001"
 	KVAddr string `json:"kv_addr"`
 
 	// HTTPAddr is the TCP address for the HTTP/JSON API and dashboard.
-	// Exposes /keys/{key}, /status, /metrics, and serves the dashboard UI.
-	// Example: "localhost:9001"
 	HTTPAddr string `json:"http_addr"`
 }
 
@@ -74,14 +64,6 @@ func (c *ClusterConfig) Self(id string) (*NodeConfig, error) {
 }
 
 // Peers returns a map of id → raft_addr for every node EXCEPT myID.
-// This is passed directly to raft.New() as the peers argument.
-//
-// Example with myID="node1":
-//
-//	{
-//	  "node2": "localhost:7002",
-//	  "node3": "localhost:7003",
-//	}
 func (c *ClusterConfig) Peers(myID string) map[string]string {
 	peers := make(map[string]string, len(c.Nodes)-1)
 	for _, n := range c.Nodes {
